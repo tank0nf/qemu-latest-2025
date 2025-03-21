@@ -21,6 +21,8 @@
 #include "i82596.h"
 #include <zlib.h> /* for crc32 */
 
+#define ENABLE_DEBUG 0
+
 #if defined(ENABLE_DEBUG)
 #define DBG(x)          x
 #else
@@ -445,6 +447,11 @@ void i82596_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
     case PORT_RESET: /* Reset */
         i82596_s_reset(s);
         break;
+    case PORT_SELFTEST:
+        s->scb_status |= SCB_STATUS_CX;
+        update_scb_status(s);
+        trace_i82596_selftest("Self-test initiated and completed successfully");
+        break;
     case PORT_ALTSCP:
         s->scp = val;
         break;
@@ -464,6 +471,12 @@ void i82596_h_reset(void *opaque)
     I82596State *s = opaque;
 
     i82596_s_reset(s);
+    
+    /* Simulate successful self-test completion */
+    s->scb_status |= SCB_STATUS_CX;
+    update_scb_status(s);
+    
+    trace_i82596_selftest("Self-test completed successfully");
 }
 
 bool i82596_can_receive(NetClientState *nc)
