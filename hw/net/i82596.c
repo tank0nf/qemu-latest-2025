@@ -21,7 +21,7 @@
 #include "i82596.h"
 #include <zlib.h> /* for crc32 */
 
-#define ENABLE_DEBUG 0
+#define ENABLE_DEBUG 1
 
 #if defined(ENABLE_DEBUG)
 #define DBG(x)          x
@@ -74,6 +74,8 @@ enum commands {
 
 #define I596_EOF        0x8000
 #define SIZE_MASK       0x3fff
+#define STAT_SHORT      0x0800  /* Frame shorter than minimum */
+
 
 /* various flags in the chip config registers */
 #define I596_PREFETCH   (s->config[0] & 0x80)
@@ -154,6 +156,10 @@ static void i82596_transmit(I82596State *s, uint32_t addr)
             DBG(PRINT_PKTHDR("Send", &s->tx_buffer));
             DBG(printf("Sending %d bytes\n", len));
             qemu_send_packet(qemu_get_queue(s->nic), s->tx_buffer, len);
+            printf("i82596 TRANSMIT Stats: frames=%u, bytes=%u\n", 
+                s->tx_frames, s->tx_bytes);
+            s->tx_frames++;
+            s->tx_bytes += len;
         }
 
         /* was this the last package? */
@@ -229,6 +235,51 @@ static void i82596_s_reset(I82596State *s)
     s->lnkst = 0x8000; /* initial link state: up */
     s->ca = s->ca_active = 0;
     s->send_irq = 0;
+    s->crc_err = 0;
+    s->align_err = 0;
+    s->resource_err = 0;
+    s->overrun_err = 0;
+    s->rx_frames = 0;
+    s->rx_bytes = 0;
+    s->tx_frames = 0;
+    s->tx_bytes = 0;
+    s->collisions = 0;
+    s->late_collisions = 0;
+    s->deferred_tx = 0;
+    s->rx_short_frame = 0;
+    s->rx_too_long_frame = 0;
+}
+
+static void i82596_dump_statistics(I82596State *s)
+{
+    /* Update the memory dump area with our statistics */
+    uint32_t dump_addr = s->cmd_p;
+    
+    /* Write statistical data to dump buffer */
+    set_uint32(dump_addr + 8, s->tx_frames);
+    set_uint32(dump_addr + 12, s->rx_frames);
+    set_uint32(dump_addr + 16, s->crc_err);
+    set_uint32(dump_addr + 20, s->align_err);
+    set_uint32(dump_addr + 24, s->resource_err);
+    set_uint32(dump_addr + 28, s->overrun_err);
+    set_uint32(dump_addr + 32, s->rx_short_frame);
+    set_uint32(dump_addr + 36, s->rx_too_long_frame);
+    set_uint32(dump_addr + 40, s->collisions);
+    set_uint32(dump_addr + 44, s->late_collisions);
+    set_uint32(dump_addr + 48, s->deferred_tx);
+    set_uint32(dump_addr + 52, s->tx_bytes);
+    set_uint32(dump_addr + 56, s->rx_bytes);
+    
+    /* Log statistics for debugging */
+    DBG(printf("i82596 Statistics:\n"));
+    DBG(printf("  Frames: TX=%u, RX=%u\n", s->tx_frames, s->rx_frames));
+    DBG(printf("  Bytes: TX=%u, RX=%u\n", s->tx_bytes, s->rx_bytes));
+    DBG(printf("  Errors: CRC=%u, Align=%u, Resource=%u, Overrun=%u\n",
+           s->crc_err, s->align_err, s->resource_err, s->overrun_err));
+    DBG(printf("  Short frames=%u, Too long frames=%u\n",
+           s->rx_short_frame, s->rx_too_long_frame));
+    DBG(printf("  Collisions=%u, Late collisions=%u, Deferred=%u\n",
+           s->collisions, s->late_collisions, s->deferred_tx));
 }
 
 
@@ -282,6 +333,11 @@ static void command_loop(I82596State *s)
             set_multicast_list(s, s->cmd_p);
             break;
         case CmdDump:
+            printf("i82596 DUMP COMMAND - Statistics being saved to memory\n");
+            i82596_dump_statistics(s);
+            printf("i82596 Statistics Dumped: TX=%u, RX=%u frames\n", 
+                   s->tx_frames, s->rx_frames);
+            break;
         case CmdDiagnose:
             printf("FIXME Command %d !!\n", cmd & 7);
             g_assert_not_reached();
@@ -458,6 +514,17 @@ void i82596_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
     case PORT_CA:
         signal_ca(s);
         break;
+    case PORT_DUMP_STATS: /* Special debug port command */
+        printf("i82596 Statistics (from PORT_DUMP_STATS):\n");
+        printf("  Frames: TX=%u, RX=%u\n", s->tx_frames, s->rx_frames);
+        printf("  Bytes: TX=%u, RX=%u\n", s->tx_bytes, s->rx_bytes);
+        printf("  Errors: CRC=%u, Align=%u, Resource=%u, Overrun=%u\n",
+               s->crc_err, s->align_err, s->resource_err, s->overrun_err);
+        printf("  Short frames=%u, Too long frames=%u\n",
+               s->rx_short_frame, s->rx_too_long_frame);
+        printf("  Collisions=%u, Late collisions=%u, Deferred=%u\n",
+               s->collisions, s->late_collisions, s->deferred_tx);
+        break;
     }
 }
 
@@ -501,6 +568,7 @@ bool i82596_can_receive(NetClientState *nc)
 ssize_t i82596_receive(NetClientState *nc, const uint8_t *buf, size_t sz)
 {
     I82596State *s = qemu_get_nic_opaque(nc);
+    uint16_t is_short_frame = 0;
     uint32_t rfd_p;
     uint32_t rbd;
     uint16_t is_broadcast = 0;
@@ -512,6 +580,9 @@ ssize_t i82596_receive(NetClientState *nc, const uint8_t *buf, size_t sz)
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
     DBG(printf("i82596_receive() start\n"));
+    
+    s->rx_frames++;
+    s->rx_bytes += sz;
 
     if (USE_TIMER && timer_pending(s->flush_queue_timer)) {
         return 0;
@@ -530,8 +601,20 @@ ssize_t i82596_receive(NetClientState *nc, const uint8_t *buf, size_t sz)
 
     /* Received frame smaller than configured "min frame len"? */
     if (sz < s->config[10]) {
-        printf("Received frame too small, %zu vs. %u bytes\n",
-               sz, s->config[10]);
+        s->rx_short_frame++;  // Increment the counter
+        is_short_frame = 1;   // Set flag for later use
+        DBG(printf("Received frame too small, %zu vs. %u bytes\n",
+               sz, s->config[10]));
+    }
+
+    /* Check for oversized frames - assuming a max frame size of 1518 */
+    if (sz > 1518) {
+        s->rx_too_long_frame++;
+    }
+
+    rfd_p = get_uint32(s->scb + 8); /* get Receive Frame Descriptor */
+    if (!rfd_p || rfd_p == I596_NULL) {
+        s->resource_err++;
         return -1;
     }
 
@@ -595,8 +678,8 @@ ssize_t i82596_receive(NetClientState *nc, const uint8_t *buf, size_t sz)
     crc = cpu_to_be32(crc32(~0, buf, sz));
     crc_ptr = (uint8_t *) &crc;
 
-    rfd_p = get_uint32(s->scb + 8); /* get Receive Frame Descriptor */
-    assert(rfd_p && rfd_p != I596_NULL);
+    // rfd_p = get_uint32(s->scb + 8); /* get Receive Frame Descriptor */
+    // assert(rfd_p && rfd_p != I596_NULL);
 
     /* get first Receive Buffer Descriptor Address */
     rbd = get_uint32(rfd_p + 8);
@@ -685,6 +768,9 @@ ssize_t i82596_receive(NetClientState *nc, const uint8_t *buf, size_t sz)
         set_uint32(next_rfd + 8, rbd);
 
         status = STAT_C | STAT_OK | is_broadcast;
+        if (is_short_frame) {
+            status |= STAT_SHORT;  // Set short frame error bit
+        }
         set_uint16(rfd_p, status);
 
         if (command & CMD_SUSP) {  /* suspend after command? */
@@ -718,6 +804,8 @@ ssize_t i82596_receive(NetClientState *nc, const uint8_t *buf, size_t sz)
         DBG(printf("Next Receive: rbd is %08x\n", rbd));
     }
 
+    printf("i82596 RECEIVE Stats: frames=%u, bytes=%u, short=%u, too_long=%u, resource_err=%u\n",
+        s->rx_frames, s->rx_bytes, s->rx_short_frame, s->rx_too_long_frame, s->resource_err);
     return sz;
 }
 

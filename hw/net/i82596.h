@@ -11,6 +11,7 @@
 #define PORT_ALTSCP             0x02    /* alternate SCB address */
 #define PORT_ALTDUMP            0x03    /* Alternate DUMP address */
 #define PORT_CA                 0x10    /* QEMU-internal CA signal */
+#define PORT_DUMP_STATS         0x04    /* Debug port to dump statistics */
 
 typedef struct I82596State_st I82596State;
 
@@ -33,6 +34,21 @@ struct I82596State_st {
     int ca;
     int ca_active;
     int send_irq;
+
+    /* Statistical counters */
+    uint32_t crc_err;             /* CRC errors */
+    uint32_t align_err;           /* Alignment errors */
+    uint32_t resource_err;        /* Resource errors */
+    uint32_t overrun_err;         /* Overrun errors */
+    uint32_t rx_frames;           /* Total frames received */
+    uint32_t rx_bytes;            /* Total bytes received */
+    uint32_t tx_frames;           /* Total frames transmitted */
+    uint32_t tx_bytes;            /* Total bytes transmitted */
+    uint32_t collisions;          /* Collision count */
+    uint32_t late_collisions;     /* Late collision count */
+    uint32_t deferred_tx;         /* Deferred transmissions */
+    uint32_t rx_short_frame;      /* Frames shorter than minimum */
+    uint32_t rx_too_long_frame;   /* Frames longer than maximum */
 
     /* Hash register (multicast mask array, multiple individual addresses). */
     uint8_t mult[8];
