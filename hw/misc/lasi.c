@@ -11,16 +11,17 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
-#include "qemu/log.h"
 #include "qapi/error.h"
+#include "hw/core/cpu.h"
 #include "trace.h"
+#include "hw/hw.h"
 #include "hw/irq.h"
 #include "system/system.h"
 #include "system/runstate.h"
-#include "migration/vmstate.h"
-#include "qom/object.h"
 #include "hw/misc/lasi.h"
+#include "migration/vmstate.h"
 
+#define TYPE_LASI_CHIP "lasi-chip"
 
 static bool lasi_chip_mem_valid(void *opaque, hwaddr addr,
                                 unsigned size, bool is_write,
@@ -127,12 +128,8 @@ static MemTxResult lasi_chip_write_with_attrs(void *opaque, hwaddr addr,
         /* read-only.  */
         break;
     case LASI_IMR:
-        s->imr = val;
-        if (((val & LASI_IRQ_BITS) != val) && (val != 0xffffffff)) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                "LASI: tried to set invalid %lx IMR value.\n",
-                (unsigned long) val);
-        }
+        s->imr = val;  /* 0x20 ?? */
+        assert((val & LASI_IRQ_BITS) == val);
         break;
     case LASI_IPR:
         /* Any write to IPR clears the register. */
@@ -237,6 +234,8 @@ static void lasi_set_irq(void *opaque, int irq, int level)
                 stl_be_phys(&address_space_memory, iar & -32, iar & 31);
             }
         }
+    } else {
+        s->ipr &= ~bit;
     }
 }
 
