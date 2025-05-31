@@ -2,10 +2,14 @@
  * QEMU Intel i82596 (Apricot) emulation
  *
  * Copyright (c) 2019 Helge Deller <deller@gmx.de>
+ * 
+ * Actively being devleoped by Soumyajyotii Ssarkar <soumyajyotisarkar23@gmail.com>
+ * During GSoC 2025
+ * 
  * This work is licensed under the GNU GPL license version 2 or later.
  *
  * This software was written to be compatible with the specification:
- * https://www.intel.com/assets/pdf/general/82596ca.pdf
+ * TODO: Add proper link to the i82596 specification datasheet
  */
 
 #include "qemu/osdep.h"
@@ -21,13 +25,15 @@
 #include "i82596.h"
 #include <zlib.h> /* for crc32 */
 
+#define ENABLE_DEBUG    1
+
 #if defined(ENABLE_DEBUG)
 #define DBG(x)          x
 #else
 #define DBG(x)          do { } while (0)
 #endif
 
-#define USE_TIMER       0
+#define USE_TIMER       1
 
 #define BITS(n, m) (((0xffffffffU << (31 - n)) >> (31 - n + m)) << m)
 
@@ -130,38 +136,68 @@ struct qemu_ether_header {
            be16_to_cpu(hdr->ether_type));       \
 } while (0)
 
-static void i82596_transmit(I82596State *s, uint32_t addr)
+static bool i82596_transmit(I82596State *s, uint32_t addr)
 {
-    uint32_t tdb_p; /* Transmit Buffer Descriptor */
+    uint16_t command;
+    uint8_t *packet_buffer = s->tx_buffer;
+    int total_len = 0;
+    command = get_uint16(addr + 2);
 
-    /* TODO: Check flexible mode */
-    tdb_p = get_uint32(addr + 8);
-    while (tdb_p != I596_NULL) {
+    if (command & CMD_FLEX) {
+        /* Flexible Mode - Process TBD chain */
+        uint32_t tbd_p = get_uint32(addr + 8);
+        while (tbd_p != I596_NULL && total_len < sizeof(s->tx_buffer)) {
         uint16_t size, len;
         uint32_t tba;
-
-        size = get_uint16(tdb_p);
+        size = get_uint16(tbd_p);
         len = size & SIZE_MASK;
-        tba = get_uint32(tdb_p + 8);
-        trace_i82596_transmit(len, tba);
-
-        if (s->nic && len) {
-            assert(len <= sizeof(s->tx_buffer));
-            address_space_read(&address_space_memory, tba,
-                               MEMTXATTRS_UNSPECIFIED, s->tx_buffer, len);
-            DBG(PRINT_PKTHDR("Send", &s->tx_buffer));
-            DBG(printf("Sending %d bytes\n", len));
-            qemu_send_packet(qemu_get_queue(s->nic), s->tx_buffer, len);
+        tba = get_uint32(tbd_p + 8);
+        if (len > 0 && (total_len + len) <= sizeof(s->tx_buffer)) {
+            address_space_read(&address_space_memory, tba, 
+                MEMTXATTRS_UNSPECIFIED,
+                packet_buffer + total_len, len);
+            total_len += len;
         }
-
-        /* was this the last package? */
+        trace_i82596_transmit(len, tba);
+        /* Check for end of frame */
         if (size & I596_EOF) {
             break;
         }
-
-        /* get next buffer pointer */
-        tdb_p = get_uint32(tdb_p + 4);
+        /* Get next TBD pointer */
+        tbd_p = get_uint32(tbd_p + 4);
+        }
+    } else {
+        /* Simplex Mode - Direct buffer in command */
+        uint16_t tcb_bytes = get_uint16(addr + 8); /* byte count in TCB */
+        uint32_t tcb_data = addr + 16; /* data starts at offset 16 in TCB */
+        if (tcb_bytes > 0 && tcb_bytes <= sizeof(s->tx_buffer)) {
+            address_space_read(&address_space_memory, tcb_data,
+                MEMTXATTRS_UNSPECIFIED, packet_buffer, tcb_bytes);
+        total_len = tcb_bytes;
+            trace_i82596_transmit_simplex(tcb_bytes, tcb_data);
+            }
+        }
+    /* When sending the packet it is common for both modes */
+    if (s->nic && total_len > 0) {
+        if (!I596_NOCRC_INS) {
+            uint32_t crc = cpu_to_be32(crc32(~0, s->tx_buffer, total_len));
+            if (total_len + 4 <= sizeof(s->tx_buffer)) {
+                memcpy(s->tx_buffer + total_len, &crc, 4);
+                total_len += 4;
+                trace_i82596_transmit_crc_inserted(total_len);
+            } else {
+                trace_i82596_error("No space for CRC insertion");
+                return false;
+            }
+        } else {
+            trace_i82596_transmit_crc_disabled(total_len);
+        }
+        DBG(PRINT_PKTHDR("Send", s->tx_buffer));
+        DBG(printf("Sending %d bytes\n", total_len));
+        qemu_send_packet(qemu_get_queue(s->nic), s->tx_buffer, total_len);
+        return true;
     }
+    return false;
 }
 
 static void set_individual_address(I82596State *s, uint32_t addr)
@@ -179,26 +215,35 @@ static void set_individual_address(I82596State *s, uint32_t addr)
 
 static void set_multicast_list(I82596State *s, uint32_t addr)
 {
-    uint16_t mc_count, i;
+    uint16_t mc_count, mc_cnt_bytes;
+    uint8_t multicast_addr[ETH_ALEN];
+    int i;
 
     memset(&s->mult[0], 0, sizeof(s->mult));
-    mc_count = get_uint16(addr + 8) / ETH_ALEN;
-    addr += 10;
+    mc_cnt_bytes = get_uint16(addr + 8);
+    mc_count = mc_cnt_bytes / ETH_ALEN;
+    
+
     if (mc_count > MAX_MC_CNT) {
         mc_count = MAX_MC_CNT;
     }
+    trace_i82596_multicast_setup(mc_count);
+    
     for (i = 0; i < mc_count; i++) {
-        uint8_t multicast_addr[ETH_ALEN];
-        address_space_read(&address_space_memory, addr + i * ETH_ALEN,
-                           MEMTXATTRS_UNSPECIFIED, multicast_addr, ETH_ALEN);
-        DBG(printf("Add multicast entry " MAC_FMT "\n",
-                    MAC_ARG(multicast_addr)));
-        unsigned mcast_idx = (net_crc32(multicast_addr, ETH_ALEN) &
-                              BITS(7, 2)) >> 2;
-        assert(mcast_idx < 8 * sizeof(s->mult));
+        address_space_read(&address_space_memory, 
+                           addr + 10 + (i * ETH_ALEN),
+                           MEMTXATTRS_UNSPECIFIED, 
+                           multicast_addr, ETH_ALEN);
+        
+        unsigned mcast_idx = (net_crc32(multicast_addr, ETH_ALEN) >> 26) & 0x3f;
+        
         s->mult[mcast_idx >> 3] |= (1 << (mcast_idx & 7));
+        
+        trace_i82596_multicast_addr(multicast_addr[0], multicast_addr[1], 
+                                    multicast_addr[2], multicast_addr[3],
+                                    multicast_addr[4], multicast_addr[5], 
+                                    mcast_idx);
     }
-    trace_i82596_set_multicast(mc_count);
 }
 
 void i82596_set_link_status(NetClientState *nc)
@@ -229,12 +274,31 @@ static void i82596_s_reset(I82596State *s)
     s->send_irq = 0;
 }
 
+static void i82596_configure(I82596State *s, uint32_t addr){
+    uint8_t byte_cnt;
+    byte_cnt = get_byte(addr + 8) & 0x0f;
+    byte_cnt = MAX(byte_cnt, 4);
+    byte_cnt = MIN(byte_cnt, sizeof(s->config));
+    /* copy byte_cnt max. */
+    address_space_read(&address_space_memory, addr + 8,
+                       MEMTXATTRS_UNSPECIFIED, s->config, byte_cnt);
+    /* config byte according to page 35ff */
+    s->config[2] &= 0x82; /* mask valid bits */
+    s->config[2] |= 0x40;
+    s->config[7]  &= 0xf7; /* clear zero bit */
+    s->config[8] &= ~0x08; /* clear NOCRC_INS bit to enable CRC insertion by OS*/
+    s->config[10] = MAX(s->config[10], 5); /* min frame length */
+    printf("Driver configured MIN_FRAME_LEN = %u bytes\n", s->config[10]);
+    s->config[12] &= 0x40; /* only full duplex field valid */
+    s->config[13] |= 0x3f; /* set ones in byte 13 */
+    trace_i82596_configure_complete(byte_cnt);
+}
+
 
 static void command_loop(I82596State *s)
 {
     uint16_t cmd;
     uint16_t status;
-    uint8_t byte_cnt;
 
     DBG(printf("STARTING COMMAND LOOP cmd_p=%08x\n", s->cmd_p));
 
@@ -242,84 +306,85 @@ static void command_loop(I82596State *s)
         /* set status */
         status = STAT_B;
         set_uint16(s->cmd_p, status);
-        status = STAT_C | STAT_OK; /* update, but write later */
 
         cmd = get_uint16(s->cmd_p + 2);
         DBG(printf("Running command %04x at %08x\n", cmd, s->cmd_p));
 
+        /* Execute command and determine status */
         switch (cmd & 0x07) {
         case CmdNOp:
+            status = STAT_C | STAT_OK;
             break;
         case CmdSASetup:
             set_individual_address(s, s->cmd_p);
+            status = STAT_C | STAT_OK;
             break;
         case CmdConfigure:
-            byte_cnt = get_byte(s->cmd_p + 8) & 0x0f;
-            byte_cnt = MAX(byte_cnt, 4);
-            byte_cnt = MIN(byte_cnt, sizeof(s->config));
-            /* copy byte_cnt max. */
-            address_space_read(&address_space_memory, s->cmd_p + 8,
-                               MEMTXATTRS_UNSPECIFIED, s->config, byte_cnt);
-            /* config byte according to page 35ff */
-            s->config[2] &= 0x82; /* mask valid bits */
-            s->config[2] |= 0x40;
-            s->config[7]  &= 0xf7; /* clear zero bit */
-            assert(I596_NOCRC_INS == 0); /* do CRC insertion */
-            s->config[10] = MAX(s->config[10], 5); /* min frame length */
-            s->config[12] &= 0x40; /* only full duplex field valid */
-            s->config[13] |= 0x3f; /* set ones in byte 13 */
+            i82596_configure(s, s->cmd_p);
+            status = STAT_C | STAT_OK;
             break;
         case CmdTDR:
             /* get signal LINK */
             set_uint32(s->cmd_p + 8, s->lnkst);
+            status = STAT_C | STAT_OK;
             break;
         case CmdTx:
-            i82596_transmit(s, s->cmd_p);
+            /* Check if transmit was valid (CMD_FLEX required) */
+            if (i82596_transmit(s, s->cmd_p)) {
+                status = STAT_C | STAT_OK;
+            } else {
+                status = STAT_C | STAT_A;  /* Aborted - no CMD_FLEX */
+            }
             break;
         case CmdMulticastList:
             set_multicast_list(s, s->cmd_p);
+            status = STAT_C | STAT_OK;
             break;
         case CmdDump:
         case CmdDiagnose:
             printf("FIXME Command %d !!\n", cmd & 7);
-            g_assert_not_reached();
+            status = STAT_C | STAT_A;  /* Mark as aborted */
+            break;
+        default:
+            status = STAT_C | STAT_A;  /* Unknown command */
+            break;
         }
 
         /* update status */
         set_uint16(s->cmd_p, status);
+        
+        /* Handle interrupt request */
+        if (cmd & CMD_INTR) {
+            s->scb_status |= SCB_STATUS_CX;
+            qemu_set_irq(s->irq, 1);
+        }
+        
+        /* Check for end of list before advancing */
+        if (cmd & CMD_EOL) {
+            s->cu_status = CU_IDLE;
+            s->scb_status |= SCB_STATUS_CNA; /* CU left active state */
+            s->cmd_p = I596_NULL;
+            break;
+        }
+        
+        /* Check for suspend before advancing to next command */
+        if (cmd & CMD_SUSP) {
+            s->cu_status = CU_SUSPENDED;
+            s->scb_status |= SCB_STATUS_CNA; /* CU left active state */
+            trace_i82596_command_suspended(s->cmd_p, cmd);
+            break; /* Exit command loop */
+        }
 
+
+        /* Advance to next command */
         s->cmd_p = get_uint32(s->cmd_p + 4); /* get link address */
         DBG(printf("NEXT addr would be %08x\n", s->cmd_p));
         if (s->cmd_p == 0) {
             s->cmd_p = I596_NULL;
         }
 
-        /* Stop when last command of the list. */
-        if (cmd & CMD_EOL) {
-            s->cmd_p = I596_NULL;
-        }
-        /* Suspend after doing cmd? */
-        if (cmd & CMD_SUSP) {
-            s->cu_status = CU_SUSPENDED;
-            printf("FIXME SUSPEND !!\n");
-        }
-        /* Interrupt after doing cmd? */
-        if (cmd & CMD_INTR) {
-            s->scb_status |= SCB_STATUS_CX;
-        } else {
-            s->scb_status &= ~SCB_STATUS_CX;
-        }
-        update_scb_status(s);
-
-        /* Interrupt after doing cmd? */
-        if (cmd & CMD_INTR) {
-            s->send_irq = 1;
-        }
-
-        if (s->cu_status != CU_ACTIVE) {
-            break;
-        }
     }
+    update_scb_status(s);
     DBG(printf("FINISHED COMMAND LOOP\n"));
     qemu_flush_queued_packets(qemu_get_queue(s->nic));
 }
@@ -354,6 +419,21 @@ static void examine_scb(I82596State *s)
         break;
     case 1:     /* CUC_START */
         s->cu_status = CU_ACTIVE;
+        s->cmd_p = get_uint32(s->scb + 4);
+        break;
+    case 2:     /* CUC_RESUME */
+        if (s->cu_status == CU_SUSPENDED) {
+            s->cu_status = CU_ACTIVE;
+            if (s->cmd_p != I596_NULL) {
+            command_loop(s); // I dont think driver ever calls this??
+            }
+        }
+        break;
+    case 3:     /* CUC_SUSPEND */
+        if (s->cu_status == CU_ACTIVE) {
+            s->cu_status = CU_SUSPENDED;
+            s->scb_status |= SCB_STATUS_CNA;
+        }
         break;
     case 4:     /* CUC_ABORT */
         s->cu_status = CU_SUSPENDED;
@@ -387,17 +467,13 @@ static void examine_scb(I82596State *s)
         i82596_s_reset(s);
     }
 
-    /* execute commands from SCBL */
-    if (s->cu_status != CU_SUSPENDED) {
-        if (s->cmd_p == I596_NULL) {
-            s->cmd_p = get_uint32(s->scb + 4);
-        }
-    }
-
     /* update scb status */
     update_scb_status(s);
 
-    command_loop(s);
+    if (s->cu_status == CU_ACTIVE && 
+        s->cmd_p != I596_NULL) {
+        command_loop(s);
+    }
 }
 
 static void signal_ca(I82596State *s)
@@ -515,6 +591,8 @@ ssize_t i82596_receive(NetClientState *nc, const uint8_t *buf, size_t sz)
         return -1;
     }
 
+    printf("Frame size check: received=%zu, min_required=%u, includes_crc=%s\n", 
+       sz, s->config[10], "unknown");
     /* Received frame smaller than configured "min frame len"? */
     if (sz < s->config[10]) {
         printf("Received frame too small, %zu vs. %u bytes\n",
@@ -711,11 +789,23 @@ ssize_t i82596_receive(NetClientState *nc, const uint8_t *buf, size_t sz)
 
 const VMStateDescription vmstate_i82596 = {
     .name = "i82596",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(lnkst, I82596State),
-        VMSTATE_TIMER_PTR(flush_queue_timer, I82596State),
+        // VMSTATE_TIMER_PTR(flush_queue_timer, I82596State),
+        VMSTATE_UINT64(scp, I82596State),
+        VMSTATE_UINT8(sysbus, I82596State),
+        VMSTATE_UINT32(scb, I82596State),
+        VMSTATE_UINT16(scb_status, I82596State),
+        VMSTATE_UINT8(cu_status, I82596State),
+        VMSTATE_UINT8(rx_status, I82596State),
+        VMSTATE_UINT32(cmd_p, I82596State),
+        VMSTATE_INT32(ca, I82596State),
+        VMSTATE_INT32(ca_active, I82596State),
+        VMSTATE_INT32(send_irq, I82596State),
+        VMSTATE_BUFFER(mult, I82596State),
+        VMSTATE_BUFFER(config, I82596State),
         VMSTATE_END_OF_LIST()
     }
 };
