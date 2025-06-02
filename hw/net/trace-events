@@ -434,7 +434,6 @@ i82596_transmit_crc_inserted(int total_len) "CRC inserted, total packet length=%
 i82596_transmit_crc_disabled(int total_len) "CRC insertion disabled, packet length=%d"
 i82596_new_mac(const char *mac) "MAC address set to %s"
 i82596_multicast_setup(uint16_t count) "Setting up %d multicast addresses"
-i82596_multicast_addr(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4, uint8_t b5, unsigned idx) "Multicast addr %02x:%02x:%02x:%02x:%02x:%02x -> hash index %d"
 i82596_receive_analysis(const char *msg) "RX: %s"
 i82596_receive_packet(size_t len) "Received packet, length=%zu"
 i82596_transmit_simplex(uint16_t tcb_bytes, uint32_t tcb_data) "Simplex mode enabled, TCB bytes=%d, data=0x%08x"
